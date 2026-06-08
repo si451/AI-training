@@ -1,0 +1,43 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch and Model files
+*.pth
+*.pt
+*.safetensors
+*.bin
+*.ckpt
+*.onnx
+
+# Datasets
+*.parquet
+*.jsonl
+*.csv
+*.tsv
+datasets/
+data/
+
+# Analysis and logs
+analysis/
+logs/
+*.log
+summary.json
+*.png
+*.jpg
+*.jpeg
+
+# Virtual environments
+venv/
+env/
+.env
+
+# IDEs
+.vscode/
+.idea/
+
+# Other
+.DS_Store
+*.tmp
+*.temp
