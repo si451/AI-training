@@ -1,26 +1,27 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║    NEXUS — 20B TOKEN PRETRAINING FROM SCRATCH                               ║
+║    NEXUS — PHASE 3: 10B MORE TOKENS (steps 76.5K → 153K)                  ║
 ║                                                                              ║
 ║  Architecture: 488M params, 20 layers, dim=1280, GQA, SwiGLU, Neural Memory ║
 ║                                                                              ║
 ║  Training:                                                                   ║
-║    • Phase 2: 20B more tokens (steps 76.5K → 153K)                          ║
+║    • Phase 3: 10B more tokens (total ~20B tokens)                           ║
 ║    • LR: 1.5e-4 peak, cosine → 1.5e-5, warmup 500 steps                    ║
 ║    • 8×H100 DDP + Flash Attention 2 + BFloat16                              ║
 ║    • Weight decay: 0.1, Grad clip: 2.0                                      ║
-║    • seq_len: 2048, batch: 128 seqs × 2 grad_accum                         ║
-║    • Rank-0 fetches data, broadcasts via NCCL (no HF rate limits)           ║
+║    • seq_len: 2048, batch: 64 seqs global                                   ║
+║    • HyperConnection beta L2 regularization: 0.001                          ║
+║    • Sequential dataset loading (rank-0 first, cache for others)             ║
 ║                                                                              ║
 ║  Dataset Mix (8 sources):                                                    ║
 ║   20% FineWeb-Edu 100BT    — general English, science, history              ║
-║   18% FineMath              — math reasoning (increased)                     ║
+║   18% FineMath              — math reasoning                                 ║
 ║   12% Stack-v2              — high-quality code                              ║
 ║   15% Science               — academic papers                                ║
-║   18% STEM-Reasoning CoT   — step-by-step reasoning (increased)            ║
+║   18% STEM-Reasoning CoT   — step-by-step reasoning                        ║
 ║    8% Code-Feedback         — code with explanations                          ║
 ║    5% Tool calling          — function calling                                ║
-║    2% Identity              — Nexus + Siddi Vinayaka (reduced)               ║
+║    2% Identity              — Nexus + Siddi Vinayaka                          ║
 ║                                                                              ║
 ║  Features:                                                                   ║
 ║   • Saves every 500 steps to Modal Volume                                   ║
@@ -28,6 +29,7 @@
 ║   • Self-contained checkpoints (arch config stored inside .pth)             ║
 ║   • bfloat16 + Flash Attn 2 for H100 throughput                             ║
 ║   • Keeps last 5 checkpoints                                                ║
+║   • Live memory state inspection every 500 steps                            ║
 ║                                                                              ║
 ║  Run:      modal run Train.py                                               ║
 ║  Detached: modal run --detach Train.py                                      ║
@@ -828,12 +830,12 @@ def train_worker(rank: int, world_size: int):
                     src_name = "identity"
                     toks = random.choice(identity_data)
                     if isinstance(toks, str):
-                        toks = enc.encode(toks, allowed_special={"<|endoftext|>"})
+                        toks = enc.encode(toks, allowed_special={"</longcat_tool_call>", "<|endoftext|>"})
                 elif roll < id_prob + tool_mem_prob:
                     src_name = "tool_calling_mem"
                     toks = random.choice(tool_data)
                     if isinstance(toks, str):
-                        toks = enc.encode(toks, allowed_special={"<|endoftext|>"})
+                        toks = enc.encode(toks, allowed_special={"</longcat_tool_call>", "<|endoftext|>"})
                 else:
                     src_name = random.choices(stream_keys, weights=adjusted_weights, k=1)[0]
                     it, extractor, ds_ref = streams[src_name]
@@ -872,12 +874,12 @@ def train_worker(rank: int, world_size: int):
                     src_name = "identity"
                     toks = random.choice(identity_data)
                     if isinstance(toks, str):
-                        toks = enc.encode(toks, allowed_special={"<|endoftext|>"})
+                        toks = enc.encode(toks, allowed_special={"</longcat_tool_call>", "<|endoftext|>"})
                 elif roll < id_prob + tool_mem_prob:
                     src_name = "tool_calling_mem"
                     toks = random.choice(tool_data)
                     if isinstance(toks, str):
-                        toks = enc.encode(toks, allowed_special={"<|endoftext|>"})
+                        toks = enc.encode(toks, allowed_special={"</longcat_tool_call>", "<|endoftext|>"})
                 else:
                     src_name = random.choices(stream_keys, weights=stream_w, k=1)[0]
                     it, extractor, ds_ref = streams[src_name]
@@ -1338,11 +1340,12 @@ def train_worker(rank: int, world_size: int):
             with torch.no_grad():
                 for bridge_idx, (mem_mod, mem_state) in enumerate(zip(model.memory, real_memory)):
                     n_slots = mem_state.shape[1]
-                    print(f"    --- Bridge {bridge_idx} ({mem_mod.role}) | {n_slots} slots ---", flush=True)
+                    batch_size = mem_state.shape[0]
+                    print(f"    --- Bridge {bridge_idx} ({mem_mod.role}) | {n_slots} slots | batch={batch_size} ---", flush=True)
 
-                    # Show statistics about the memory state
-                    mem_float = mem_state.float()
-                    norm_per_slot = mem_float.norm(dim=-1).squeeze(0)  # [n_slots]
+                    # Show statistics about the memory state (average across batch)
+                    mem_float = mem_state.float().reshape(batch_size, n_slots, -1)
+                    norm_per_slot = mem_float.norm(dim=-1).mean(dim=0)  # [n_slots] — avg across batch
                     mean_norm = norm_per_slot.mean().item()
                     max_norm = norm_per_slot.max().item()
                     min_norm = norm_per_slot.min().item()
@@ -1354,7 +1357,7 @@ def train_worker(rank: int, world_size: int):
                     top_slots = torch.topk(norm_per_slot, k=min(5, n_slots)).indices
                     for rank_idx, slot_idx in enumerate(top_slots):
                         slot_idx_val = slot_idx.item()
-                        slot_vec = mem_float[0, slot_idx_val]  # [dim]
+                        slot_vec = mem_float[0, slot_idx_val]  # [dim] — first batch item
 
                         # Decode: project through LM head to see what tokens this slot "remembers"
                         mem_normed = model.norm(slot_vec.unsqueeze(0).unsqueeze(0))
@@ -1366,7 +1369,8 @@ def train_worker(rank: int, world_size: int):
                         for p, t in zip(top_k_probs, top_k_tokens):
                             try:
                                 decoded = enc.decode([t.item()])
-                                decoded = decoded.replace('\n', '\\n').replace('', '')
+                                if isinstance(decoded, str):
+                                    decoded = decoded.replace('\n', '\\n')
                                 tokens_str.append(f"'{decoded}'({p.item():.1%})")
                             except Exception:
                                 pass
@@ -1554,7 +1558,7 @@ def train_worker(rank: int, world_size: int):
         # On resume, all ranks load fresh documents with zeroed memory, but Adam's variance
         # buffers are calibrated to the old data distribution. Briefly ramp LR to let Adam adjust.
         # Only activates on actual resume (start_step > 1), not on fresh training.
-        resume_warmup = CFG.get("resume_warmup_steps", 250)
+        resume_warmup = CFG.get("resume_warmup_steps", 100)
         if start_step > 1 and step <= start_step + resume_warmup:
             resume_progress = (step - start_step) / max(resume_warmup, 1)
             lr = lr * max(resume_progress, 0.01)  # never fully zero — allow tiny updates
