@@ -27,7 +27,7 @@ Nexus is a 20-layer transformer (~488M parameters) with a brain-inspired memory 
 
 | Component | Value |
 |-----------|-------|
-| Parameters | 488M (0.488B) |
+| Parameters | 512M (0.512B) |
 | Layers | 20 |
 | Hidden dim | 1280 |
 | Attention heads | 16 (GQA with 4 KV heads) |
