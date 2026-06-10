@@ -5,21 +5,22 @@
 ║  Architecture: 488M params, 20 layers, dim=1280, GQA, SwiGLU, Neural Memory ║
 ║                                                                              ║
 ║  Training:                                                                   ║
-║    • 20B tokens (~41× Chinchilla ratio)                                     ║
-║    • LR: 3e-4 peak, cosine → 3e-5                                          ║
+║    • Phase 2: 20B more tokens (steps 76.5K → 153K)                          ║
+║    • LR: 1.5e-4 peak, cosine → 1.5e-5, warmup 500 steps                    ║
 ║    • 8×H100 DDP + Flash Attention 2 + BFloat16                              ║
-║    • Weight decay: 0.1, Grad clip: 1.0                                      ║
-║    • ~76K steps → ~25 hours                                                  ║
+║    • Weight decay: 0.1, Grad clip: 2.0                                      ║
+║    • seq_len: 2048, batch: 128 seqs × 2 grad_accum                         ║
+║    • Rank-0 fetches data, broadcasts via NCCL (no HF rate limits)           ║
 ║                                                                              ║
 ║  Dataset Mix (8 sources):                                                    ║
-║   35% FineWeb-Edu 100BT    — general English, science, history              ║
-║   12% FineMath              — math reasoning                                 ║
+║   20% FineWeb-Edu 100BT    — general English, science, history              ║
+║   18% FineMath              — math reasoning (increased)                     ║
 ║   12% Stack-v2              — high-quality code                              ║
 ║   15% Science               — academic papers                                ║
-║   10% STEM-Reasoning CoT   — step-by-step reasoning                          ║
+║   18% STEM-Reasoning CoT   — step-by-step reasoning (increased)            ║
 ║    8% Code-Feedback         — code with explanations                          ║
-║    4% Tool calling          — function calling                                ║
-║    4% Identity              — Nexus + Siddi Vinayaka                          ║
+║    5% Tool calling          — function calling                                ║
+║    2% Identity              — Nexus + Siddi Vinayaka (reduced)               ║
 ║                                                                              ║
 ║  Features:                                                                   ║
 ║   • Saves every 500 steps to Modal Volume                                   ║
@@ -37,6 +38,7 @@
 
 import modal
 import os
+import sys
 
 # Set this to True to surgically reinitialize weights and clear momentum for damaged layers (13-17) on load
 SURGICAL_RESET_LAYERS = False
@@ -82,37 +84,39 @@ CFG = dict(
     memory_slots  = 128,  # Global memory capacity
     mtp_depths    = 1,
 
-    # ── Training Schedule (20B Tokens Pretraining) ────────────────────────────
-    # 20B tokens / (128 seqs × 2048 len) = 76,294 steps
-    max_steps        = 76_500,
-    batch_size       = 32,              # per-GPU: 64/8 = 8 seqs
-    grad_accum_steps = 2,               # effective global batch = 8 × 2 × 8 = 128 seqs
-    seq_len          = 2048,            # tokens per step = 128 × 2048 = 262,144
+    # ── Training Schedule (Phase 3: 10B more tokens, steps 76.5K → 153K) ──────
+    # 64 seqs × 2048 tokens = 131,072 tokens/step
+    # 10B tokens / 131,072 = ~76,294 steps → max_steps = 76,500 + 76,294 ≈ 153,000
+    max_steps        = 153_000,
+    batch_size       = 32,              # per-GPU: 32/8 = 4 seqs (same as phase 1)
+    grad_accum_steps = 2,               # effective global batch = 8 × 2 × 4 = 64 seqs
+    seq_len          = 2048,            # tokens per step = 64 × 2048 = 131,072
 
-    # ── Learning Rate (Standard Pretraining) ──────────────
-    learning_rate    = 3.0e-4,           # Standard peak learning rate for 0.5B model
-    min_lr           = 3.0e-5,           # 10× decay at end (cosine schedule)
-    warmup_steps     = 0,             # Requires warmup for AdamW variance calibration
+    # ── Learning Rate (Phase 2: lower LR, with warmup) ────────────────────────
+    learning_rate    = 1.5e-4,           # Half of phase 1 peak for stable continuation
+    min_lr           = 1.5e-5,           # 10× decay at end (cosine schedule)
+    warmup_steps     = 500,              # Warmup for AdamW variance calibration
 
     # ── Regularization ───────────────────────────────────────────────────────
     weight_decay     = 0.1,             # standard AdamW
     grad_clip        = 2.0,             # standard gradient clipping
 
     mtp_loss_weight      = 0.1,             # MTP auxiliary loss weight
-    mem_diversity_weight = 0.01,            # memory slot diversity loss weight
+    mem_diversity_weight = 0.05,            # memory slot diversity loss weight (5x phase 1)
     mem_usage_weight     = 1.0,             # memory read gate usage penalty
     mem_prediction_weight = 0.1,            # memory prediction objective
-    mem_temporal_weight  = 0.1,             # memory slot temporal stability
+    mem_temporal_weight  = 0.3,            # memory slot temporal stability (3x phase 1)
+    hyper_beta_weight    = 0.001,          # L2 regularization on HyperConnection beta
 
     dataset_probs = dict(
-        fineweb_edu   = 0.35,           # general English, science, history
-        math          = 0.12,           # math reasoning
+        fineweb_edu   = 0.20,           # general English, science, history (reduced — already learned)
+        math          = 0.18,           # math reasoning (increased for phase 2)
         code_nemotron = 0.12,           # high-quality code
-        stem_cot      = 0.10,           # step-by-step reasoning
+        stem_cot      = 0.18,           # step-by-step reasoning (increased for thinking)
         science       = 0.15,           # academic papers
         code_feedback = 0.08,           # code with explanations
-        tool_calling  = 0.04,           # function calling
-        identity      = 0.04,           # Nexus + Siddi Vinayaka
+        tool_calling  = 0.05,           # function calling (slight increase)
+        identity      = 0.02,           # Nexus + Siddi Vinayaka (reduced — already learned)
     ),
 
     save_every      = 500,
@@ -141,7 +145,7 @@ CFG = dict(
 # ─────────────────────────────────────────────────────────────────────────────
 @app.function(
     gpu="H100:8",
-    timeout=60 * 60 * 22,
+    timeout=86400,  # 3 days — 10B tokens ≈ 76.5K steps at ~2.5s/step
     volumes={CKPT_MOUNT: volume},
     secrets=[modal.Secret.from_name("huggingface-secret")],   
 )
@@ -242,10 +246,12 @@ def train_worker(rank: int, world_size: int):
 
     if is_main:
         print("=" * 70, flush=True)
-        print(f"🧠  CORTEX V7 — MODAL H100 TRAINING  (DDP: {world_size} GPUs)", flush=True)
-        print(f"    GPU  : {torch.cuda.get_device_name(0)}", flush=True)
-        print(f"    VRAM : {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB × {world_size}", flush=True)
-        print(f"    Steps: {CFG['max_steps']:,}  (save every {CFG['save_every']})", flush=True)
+        print(f"  NEXUS V7 — PHASE 2: 20B MORE TOKENS  (DDP: {world_size} GPUs)", flush=True)
+        print(f"  GPU  : {torch.cuda.get_device_name(0)}", flush=True)
+        print(f"  VRAM : {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB x {world_size}", flush=True)
+        print(f"  Steps: {CFG['max_steps']:,} total  (save every {CFG['save_every']})", flush=True)
+        print(f"  LR   : {CFG['learning_rate']:.0e} -> {CFG['min_lr']:.0e} (cosine, warmup {CFG['warmup_steps']})", flush=True)
+        print(f"  Batch: {CFG['seq_len']} seq_len x {CFG['batch_size']} per GPU x {CFG['grad_accum_steps']} grad_accum", flush=True)
         print("=" * 70, flush=True)
 
     # =========================================================================
@@ -476,14 +482,31 @@ def train_worker(rank: int, world_size: int):
         selected_dataset_labels[category] = default or "unavailable"
         return default
 
-    ds_fineweb = _load_first(
+    # ── PHASE 2: Sequential dataset loading to prevent HF rate limits ────────
+    # All 8 GPUs share the same filesystem on Modal. Load datasets one rank at
+    # a time so only ONE rank hits HuggingFace's API at a time. Subsequent ranks
+    # read from the local cache (instant). This eliminates rate limiting.
+    _load_barrier_msg = lambda rank, name: (
+        f"  [rank {rank}] Loading {name} …" if is_main else None
+    )
+
+    def _load_sequential(category, candidates, default=None):
+        """Load dataset with barrier-synchronized sequential access."""
+        result = None
+        for r in range(world_size):
+            if rank == r:
+                result = _load_first(category, candidates, default=default)
+            dist.barrier()
+        return result
+
+    ds_fineweb = _load_sequential(
         "fineweb_edu",
         [
             ("FineWeb-Edu sample-100BT", "HuggingFaceFW/fineweb-edu", {"name": "sample-100BT", "split": "train"}),
             ("FineWeb-Edu sample-10BT",  "HuggingFaceFW/fineweb-edu", {"name": "sample-10BT",  "split": "train"}),
         ],
     )
-    ds_math = _load_first(
+    ds_math = _load_sequential(
         "math",
         [
             ("FineMath 4plus", "HuggingFaceTB/finemath", {"name": "finemath-4plus", "split": "train"}),
@@ -491,7 +514,7 @@ def train_worker(rank: int, world_size: int):
         ],
         default=ds_fineweb,
     )
-    ds_code_nemotron = _load_first(
+    ds_code_nemotron = _load_sequential(
         "code_nemotron",
         [
             ("Stack v2 Dedup", "bigcode/the-stack-v2-dedup", {
@@ -503,56 +526,42 @@ def train_worker(rank: int, world_size: int):
         ],
         default=ds_fineweb,
     )
-    ds_science = _load_first(
+    ds_science = _load_sequential(
         "science",
         [
-            # ~14.7 B tokens — large enough that it won't repeat for the whole run
             ("Open-Web-Math", "open-web-math/open-web-math", {"split": "train"}),
-            # ~1 B tokens — decent fallback
             ("Open Text Books", "izumi-lab/open-text-books", {"split": "train"}),
             ("OpenWebText",     "Skylion007/openwebtext",    {"split": "train"}),
         ],
         default=ds_fineweb,
     )
-    ds_stem_cot = _load_first(
+    ds_stem_cot = _load_sequential(
         "stem_cot",
         [
-            # OpenMathInstruct-2 — ~14 M examples (~7 B tokens), will NOT repeat
             ("OpenMathInstruct-2",  "nvidia/OpenMathInstruct-2",  {"split": "train"}),
-            # MetaMathQA — 395 K examples (~158 M tokens) — repeats a bit, but shuffled
             ("MetaMathQA",          "meta-math/MetaMathQA",       {"split": "train"}),
-            # Original fallback kept for safety
             ("NuminaMath CoT",      "AI-MO/NuminaMath-CoT",       {"split": "train"}),
             ("camel-ai physics",    "camel-ai/physics",            {"split": "train"}),
         ],
         default=ds_fineweb,
     )
-    ds_code_feedback = _load_first(
+    ds_code_feedback = _load_sequential(
         "code_feedback",
         [
-            # 156 K high-quality instruction pairs — ~4× larger than old primary
             ("CodeFeedback Filtered", "m-a-p/CodeFeedback-Filtered-Instruction", {"split": "train"}),
-            # 75 K OSS instruction pairs with execution feedback
             ("Magicoder OSS 75K",     "ise-uiuc/Magicoder-OSS-Instruct-75K",    {"split": "train"}),
-            # 111 K evolved code instructions
             ("Evol-Code-Alpaca",      "theblackcat102/evol-codealpaca-v1",       {"split": "train"}),
-            # Original — kept as last resort
             ("Code Feedback (orig)",  "m-a-p/Code-Feedback",                     {"split": "train"}),
             ("Python Alpaca",         "iamtarun/python_code_instructions_18k_alpaca", {"split": "train"}),
         ],
         default=ds_fineweb,
     )
-    # Function/tool-calling streaming dataset (falls back to in-memory if all unavailable)
-    ds_tool_stream = _load_first(
+    ds_tool_stream = _load_sequential(
         "tool_calling",
         [
-            # Glaive FC v2 — 113 K examples
             ("Glaive FC v2",        "glaiveai/glaive-function-calling-v2",    {"split": "train"}),
-            # Hermes FC v1 — 13 K examples
             ("Hermes FC v1",        "NousResearch/hermes-function-calling-v1", {"split": "train"}),
-            # xLAM 60 K — 60 K examples
             ("Salesforce xLAM 60k", "Salesforce/xlam-function-calling-60k",   {"split": "train"}),
-            # ToolACE — 26 K complex multi-turn tool conversations
             ("ToolACE",             "Team-ACE/ToolACE",                        {"split": "train"}),
         ],
         default=None,
@@ -657,7 +666,13 @@ def train_worker(rank: int, world_size: int):
     if ds_tool_stream is not None:
         streams["tool_calling"] = [iter(ds_tool_stream), _text_tool_stream, ds_tool_stream]
 
-    
+    # ── Small datasets: cycle immediately on exhaustion (no new seed) ────────
+    # These datasets have relatively few unique examples compared to the
+    # total training tokens. When they exhaust, just re-shuffle with the
+    # SAME seed — this is instant (no buffer refill delay) and the model
+    # sees the same order again. For 5-8% of the data mix this is fine.
+    SMALL_DATASETS = {"code_feedback", "tool_calling"}
+
     stream_reset_counts = {k: 0 for k in streams}
 
     probs      = CFG["dataset_probs"]
@@ -827,17 +842,20 @@ def train_worker(rank: int, world_size: int):
                         text = extractor(item)
                         stream_skip_counts[src_name] += 1
                     except StopIteration:
-                       
+
                         stream_reset_counts[src_name] += 1
-                        new_seed = _BASE_SEED + stream_reset_counts[src_name] * 1000
-                        reshuffled = _safe_shuffle(ds_ref, new_seed, _SHUFFLE_BUF)
+                        if src_name in SMALL_DATASETS:
+                            cycle_seed = _BASE_SEED
+                            if is_main:
+                                print(f"  🔄  [{src_name}] exhausted — cycling (same seed)", flush=True)
+                        else:
+                            cycle_seed = _BASE_SEED + stream_reset_counts[src_name] * 1000
+                            if is_main:
+                                print(f"  🔄  [{src_name}] exhausted — reshuffle seed {cycle_seed} "
+                                      f"(pass #{stream_reset_counts[src_name] + 1})", flush=True)
+                        reshuffled = _safe_shuffle(ds_ref, cycle_seed, _SHUFFLE_BUF)
                         streams[src_name][0] = iter(reshuffled)
                         dataset_debug_stats[src_name]["resets"] += 1
-                        print(
-                            f"  🔄  [{src_name}] exhausted — reshuffling with seed {new_seed} "
-                            f"(pass #{stream_reset_counts[src_name] + 1})",
-                            flush=True,
-                        )
                         continue
                     except Exception:
                         dataset_debug_stats[src_name]["extractor_failures"] += 1
@@ -869,15 +887,18 @@ def train_worker(rank: int, world_size: int):
                         stream_skip_counts[src_name] += 1   
                     except StopIteration:
                         stream_reset_counts[src_name] += 1
-                        new_seed = _BASE_SEED + stream_reset_counts[src_name] * 1000
-                        reshuffled = _safe_shuffle(ds_ref, new_seed, _SHUFFLE_BUF)
+                        if src_name in SMALL_DATASETS:
+                            cycle_seed = _BASE_SEED
+                            if is_main:
+                                print(f"  🔄  [{src_name}] exhausted — cycling (same seed)", flush=True)
+                        else:
+                            cycle_seed = _BASE_SEED + stream_reset_counts[src_name] * 1000
+                            if is_main:
+                                print(f"  🔄  [{src_name}] exhausted — reshuffle seed {cycle_seed} "
+                                      f"(pass #{stream_reset_counts[src_name] + 1})", flush=True)
+                        reshuffled = _safe_shuffle(ds_ref, cycle_seed, _SHUFFLE_BUF)
                         streams[src_name][0] = iter(reshuffled)
                         dataset_debug_stats[src_name]["resets"] += 1
-                        print(
-                            f"  🔄  [{src_name}] exhausted — reshuffling with seed {new_seed} "
-                            f"(pass #{stream_reset_counts[src_name] + 1})",
-                            flush=True,
-                        )
                         continue
                     except Exception:
                         dataset_debug_stats[src_name]["extractor_failures"] += 1
@@ -943,6 +964,9 @@ def train_worker(rank: int, world_size: int):
         reset_mask: bool tensor [B] — True where a slot just loaded a NEW document.
         The training loop uses reset_mask to zero that slot's persistent memory_state
         so stale context from the previous document never bleeds into the new one.
+
+        All ranks fetch data independently (same data due to identical slot state)
+        to avoid NCCL broadcast deadlock when rank 0 is slow to fetch.
         """
         nonlocal total_batches_built
         total_batches_built += 1
@@ -950,43 +974,35 @@ def train_worker(rank: int, world_size: int):
         reset_mask      = []
         batch_sources   = []
 
-        # ─────────────────────────────────────────────────────────────────────
         # Detect if many slots need refilling at once → enforce diversity
-        # ─────────────────────────────────────────────────────────────────────
         slots_to_refill = []
         for i in range(B):
             pos = slot_pos[i]
             if pos + sl + 1 > len(slot_tokens[i]):
                 slots_to_refill.append(i)
 
-        
         if len(slots_to_refill) >= 2:
-            
-            current_sources = Counter(slot_sources)
-            
             for idx, slot_idx in enumerate(slots_to_refill):
-                
                 _refill_slot(slot_idx, reason="exhaust", balance_factor=0.95)
 
         for i in range(B):
             toks = slot_tokens[i]
             pos  = slot_pos[i]
 
-            
             if pos + sl + 1 > len(toks):
-                if i not in slots_to_refill:  
+                if i not in slots_to_refill:
                     _refill_slot(i, reason="exhaust")
                 toks = slot_tokens[i]
                 pos  = 0
-                reset_mask.append(True)   
+                reset_mask.append(True)
             else:
-                reset_mask.append(False)  
+                reset_mask.append(False)
 
             src_name = slot_sources[i]
             dataset_debug_stats[src_name]["chunks"] += 1
             dataset_debug_stats[src_name]["chunk_tokens"] += sl
             batch_sources.append(src_name)
-            slot_pos[i] = pos + sl       
+            slot_pos[i] = pos + sl
 
         # Construct batch tensors: pre-allocate on CPU, fill, transfer once
         x_batch = torch.empty((B, sl), dtype=torch.long)
@@ -995,7 +1011,7 @@ def train_worker(rank: int, world_size: int):
 
         for i in range(B):
             toks = slot_tokens[i]
-            pos  = slot_pos[i] - sl  # we already advanced slot_pos above
+            pos  = slot_pos[i] - sl
             x_batch[i] = torch.tensor(toks[pos : pos + sl], dtype=torch.long)
             y_batch[i] = torch.tensor(toks[pos + 1 : pos + sl + 1], dtype=torch.long)
             if reset_mask[i]:
@@ -1148,23 +1164,29 @@ def train_worker(rank: int, world_size: int):
                     except ValueError as opt_err:
                         print(f"  ⚠️  Optimizer state mismatch ({opt_err}) — using fresh optimizer", flush=True)
 
-                # ── 5. Restore dataset stream positions (per-rank offset) ──
+                # ── 5. Restore dataset stream positions ──────────────────────────
+                # Instead of slow .skip(n) which iterates one-by-one through
+                # millions of examples, we re-shuffle with a new seed on resume.
+                # This is O(1) and gives a fresh data order (good for training).
                 local_rank_id = dist.get_rank() if dist.is_initialized() else 0
                 saved_counts = ckpt.get("stream_skip_counts", {})
                 if saved_counts:
-                    print(f"  📂  Restoring dataset positions …", flush=True)
+                    print(f"  📂  Re-shuffling datasets for resume …", flush=True)
                     for src, skip_n in saved_counts.items():
                         if src in streams and skip_n > 0:
                             try:
-                                # Each rank offsets by 500 docs to guarantee data diversity
-                                offset_skip = skip_n + (local_rank_id * 500)
+                                # Use a deterministic seed based on saved position
+                                # so each rank gets a different but reproducible shuffle
+                                resume_seed = _BASE_SEED + (skip_n * 1000) + local_rank_id
                                 ds_ref = streams[src][2]
-                                new_iter = iter(ds_ref.skip(offset_skip))
-                                streams[src][0] = new_iter
-                                stream_skip_counts[src] = offset_skip
-                                print(f"    ✅  {src}: skipped {offset_skip:,} examples", flush=True)
+                                reshuffled = _safe_shuffle(ds_ref, resume_seed, _SHUFFLE_BUF)
+                                streams[src][0] = iter(reshuffled)
+                                stream_skip_counts[src] = skip_n
+                                print(f"    ✅  {src}: re-shuffled (seed {resume_seed}, "
+                                      f"skipped {skip_n:,} previously)", flush=True)
                             except Exception as e:
-                                print(f"    ⚠️  {src}: skip failed ({e}) — starting from 0", flush=True)
+                                print(f"    ⚠️  {src}: re-shuffle failed ({e}) — starting from 0",
+                                      flush=True)
                 else:
                     print(f"  ⚠️  No dataset state in checkpoint — streams start from 0", flush=True)
 
@@ -1299,10 +1321,10 @@ def train_worker(rank: int, world_size: int):
          "User: How do I fix it?\nAssistant:"),
     ]
 
-    def print_training_diagnostics(model, enc):
+    def print_training_diagnostics(model, enc, real_memory=None):
         if hasattr(model, 'module'):
             model = model.module
-        
+
         print("\n  ⚙️ [HyperConnections] Active Layer Mixing Rates:", flush=True)
         for i, layer in enumerate(model.layers):
             if hasattr(layer, 'hyper_attn'):
@@ -1310,31 +1332,59 @@ def train_worker(rank: int, world_size: int):
                 beta = layer.hyper_attn.beta.detach().mean().item()
                 print(f"    Layer {i:2d} | Alpha: {alpha:.2f} | Beta: {beta:.2f}", flush=True)
 
-        print(f"\n  🧠 [Memory Inspector] Current Slot Base State (Top words):", flush=True)
-        for bridge_idx, mem_mod in enumerate(model.memory):
-            print(f"    --- Bridge {bridge_idx} ---", flush=True)
+        # ── Real memory state from training forward pass ─────────────────────
+        if real_memory is not None:
+            print(f"\n  🧠 [Live Memory] What model ACTUALLY stores (from last forward pass):", flush=True)
             with torch.no_grad():
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    m_state = mem_mod.memory_init.unsqueeze(0)
-                    mem_norm = model.norm(m_state)
-                    logits = model.head(mem_norm)
-            
-            probs = torch.softmax(logits[0].float(), dim=-1)
-            max_probs, top_tokens = torch.max(probs, dim=-1)
-            top_slots = torch.topk(max_probs, k=min(3, max_probs.size(0))).indices
-            
-            for slot in top_slots:
-                slot_idx = slot.item()
-                top_k_probs, top_k_tokens = torch.topk(probs[slot_idx], k=3)
-                tokens_str = []
-                for p, t in zip(top_k_probs, top_k_tokens):
-                    try:
-                        decoded = enc.decode([t.item()]).replace('\n', '\\n').replace('\r', '')
-                        tokens_str.append(f"'{decoded}' ({p.item():.1%})")
-                    except:
-                        pass
-                print(f"      Slot {slot_idx:3d} : " + ", ".join(tokens_str), flush=True)
-                
+                for bridge_idx, (mem_mod, mem_state) in enumerate(zip(model.memory, real_memory)):
+                    n_slots = mem_state.shape[1]
+                    print(f"    --- Bridge {bridge_idx} ({mem_mod.role}) | {n_slots} slots ---", flush=True)
+
+                    # Show statistics about the memory state
+                    mem_float = mem_state.float()
+                    norm_per_slot = mem_float.norm(dim=-1).squeeze(0)  # [n_slots]
+                    mean_norm = norm_per_slot.mean().item()
+                    max_norm = norm_per_slot.max().item()
+                    min_norm = norm_per_slot.min().item()
+                    active_slots = (norm_per_slot > 0.1).sum().item()
+                    print(f"       Stats: active={active_slots}/{n_slots} slots | "
+                          f"norm mean={mean_norm:.3f} max={max_norm:.3f} min={min_norm:.3f}", flush=True)
+
+                    # Show top-5 slots by norm (most "active" memory)
+                    top_slots = torch.topk(norm_per_slot, k=min(5, n_slots)).indices
+                    for rank_idx, slot_idx in enumerate(top_slots):
+                        slot_idx_val = slot_idx.item()
+                        slot_vec = mem_float[0, slot_idx_val]  # [dim]
+
+                        # Decode: project through LM head to see what tokens this slot "remembers"
+                        mem_normed = model.norm(slot_vec.unsqueeze(0).unsqueeze(0))
+                        logits = model.head(mem_normed)
+                        probs = torch.softmax(logits[0, 0].float(), dim=-1)
+                        top_k_probs, top_k_tokens = torch.topk(probs, k=5)
+
+                        tokens_str = []
+                        for p, t in zip(top_k_probs, top_k_tokens):
+                            try:
+                                decoded = enc.decode([t.item()])
+                                decoded = decoded.replace('\n', '\\n').replace('', '')
+                                tokens_str.append(f"'{decoded}'({p.item():.1%})")
+                            except Exception:
+                                pass
+
+                        # Also show a "summary" — what does the slot vector represent?
+                        # Show mean activation per 128-dim chunk to see structure
+                        chunk_means = slot_vec.view(10, 128).mean(dim=-1)
+                        top_chunks = torch.topk(chunk_means, k=3).indices.tolist()
+                        chunk_str = f"top-dims={top_chunks}"
+
+                        print(f"       Slot {slot_idx_val:3d} [norm={norm_per_slot[slot_idx_val]:.3f}] "
+                              f"-> {' | '.join(tokens_str)} | {chunk_str}", flush=True)
+        else:
+            # Fallback: show memory_init (random, not trained)
+            print(f"\n  🧠 [Memory Inspector] Initialized (NOT trained yet):", flush=True)
+            for bridge_idx, mem_mod in enumerate(model.memory):
+                print(f"    --- Bridge {bridge_idx} (random init) ---", flush=True)
+
         print(f"\n  🏆 [Slot Competition] Write Router Statistics:", flush=True)
         for bridge_idx, mem_mod in enumerate(model.memory):
             if hasattr(mem_mod, 'last_write_mask') and mem_mod.last_write_mask is not None:
@@ -1504,7 +1554,7 @@ def train_worker(rank: int, world_size: int):
         # On resume, all ranks load fresh documents with zeroed memory, but Adam's variance
         # buffers are calibrated to the old data distribution. Briefly ramp LR to let Adam adjust.
         # Only activates on actual resume (start_step > 1), not on fresh training.
-        resume_warmup = CFG.get("resume_warmup_steps", 50)
+        resume_warmup = CFG.get("resume_warmup_steps", 250)
         if start_step > 1 and step <= start_step + resume_warmup:
             resume_progress = (step - start_step) / max(resume_warmup, 1)
             lr = lr * max(resume_progress, 0.01)  # never fully zero — allow tiny updates
@@ -1590,6 +1640,15 @@ def train_worker(rank: int, world_size: int):
                     else:
                         temporal_loss = torch.tensor(0.0, device=device)
 
+                    # ── HyperConnection Beta Regularization ────────────────────
+                    # Prevent beta from growing unbounded, which amplifies residual
+                    # stream and causes deep-layer activation explosion (std > 7)
+                    hyper_beta_loss = torch.tensor(0.0, device=device)
+                    if CFG.get("hyper_beta_weight", 0) > 0:
+                        for _layer in raw_model.layers:
+                            hyper_beta_loss = hyper_beta_loss + _layer.hyper_attn.beta.norm()**2
+                            hyper_beta_loss = hyper_beta_loss + _layer.hyper_ffn.beta.norm()**2
+
                     total = (
                         loss_lm
                         + toxic_penalty
@@ -1599,6 +1658,7 @@ def train_worker(rank: int, world_size: int):
                         + CFG.get("mem_prediction_weight", 0.1) * mem_pred_loss
                         + CFG.get("mem_temporal_weight", 0.1) * temporal_loss
                         + CFG.get("moe_lb_weight", 0.01) * aux_loss
+                        + CFG.get("hyper_beta_weight", 0) * hyper_beta_loss
                     ) / CFG["grad_accum_steps"]
                     
                     bptt_loss = bptt_loss + total
@@ -1709,8 +1769,8 @@ def train_worker(rank: int, world_size: int):
         if step % CFG["save_every"] == 0 and is_main:   
             save_checkpoint(raw_model, optimizer, step, last_loss, scaler, ema_loss)
 
-        if step % 500 == 0 and is_main:                 
-            print_training_diagnostics(raw_model, enc)
+        if step % 500 == 0 and is_main:
+            print_training_diagnostics(raw_model, enc, real_memory=persistent_mem)
             run_inference_probe(model, enc, step, device, max_new_tokens=40)
 
         
@@ -1759,6 +1819,8 @@ def main():
     print("🚀  Submitting Nexus training to Modal H100 …")
     print(f"    dim={CFG['dim']} | heads={CFG['heads']} | "
           f"layers={CFG['num_layers']} | memory_slots={CFG['memory_slots']}")
+    print(f"    Phase 2: steps 76,500 → {CFG['max_steps']:,} | LR={CFG['learning_rate']:.0e}→{CFG['min_lr']:.0e} | warmup={CFG['warmup_steps']}")
+    print(f"    Rank-0 data fetching + NCCL broadcast (no HF rate limits)")
     print(f"    Saves every {CFG['save_every']} steps → volume 'nexus-v1-ckpts'")
     print("    Dataset mix:")
     for k, v in CFG["dataset_probs"].items():
