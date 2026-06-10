@@ -1,4 +1,4 @@
-# Nexus — 488M Parameter Transformer with Neural Memory
+# Nexus — 512M Parameter Transformer with Neural Memory
 
 A custom transformer architecture built from scratch, featuring **Global Neural Memory** — a persistent memory system that flows through all layers. Trained on 10B+ tokens from scratch using 8x H100 GPUs on Modal.
 
