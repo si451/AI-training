@@ -534,6 +534,16 @@ def load_model(checkpoint_path: str, disable_modules: str = "", quantize: bool =
 
     clean = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model_state_dict"].items()}
     model.load_state_dict(clean, strict=False)
+    
+    # ── FIX: Reset broken memory gates after loading checkpoint ────────────────
+    with torch.no_grad():
+        import math
+        for i, mem in enumerate(model.memory):
+            # Target retentions: Lexical(0.6), Semantic(0.7), Reasoning(0.8)
+            target_retention = [0.6, 0.7, 0.8][i]
+            new_bias_val = math.log(target_retention / (1.0 - target_retention))
+            mem.gate[0].bias.data.fill_(new_bias_val)
+
     model.eval()
 
     step     = ckpt.get("step", "?")
@@ -2037,6 +2047,448 @@ def trace_memory_reads(model, enc, text, memory_state):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 9c. DEEP ANALYTICS — HyperConnection & Memory Contribution Analysis
+# ─────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def run_deep_analytics(model, enc, prompt_text, memory_state=None):
+    """Run a full forward pass with hooks to measure exactly how much
+    HyperConnections and Memory contribute to the model's output.
+    
+    Shows:
+      - Per-layer HyperConnection contribution (residual vs sublayer)
+      - Memory read gate activity per bridge
+      - Memory write routing per bridge  
+      - Output reflection gate values
+      - Ablation: output WITH vs WITHOUT memory
+      - Ablation: output WITH vs WITHOUT hyper-connections
+    """
+    if hasattr(model, 'module'):
+        model = model.module
+    
+    dev = next(model.parameters()).device
+    tokens = enc.encode(prompt_text, allowed_special={"<|endoftext|>"})
+    x = torch.tensor([tokens], dtype=torch.long, device=dev)
+    
+    _BOLD = "\033[1m"
+    _DIM = "\033[2m"
+    _RESET = "\033[0m"
+    _GREEN = "\033[32m"
+    _YELLOW = "\033[33m"
+    _RED = "\033[31m"
+    _CYAN = "\033[36m"
+    
+    print(f"\n{'═'*70}")
+    print(f"  {_BOLD}🔬 DEEP ANALYTICS — Component Contribution Analysis{_RESET}")
+    print(f"{'═'*70}")
+    print(f"  Prompt: \"{prompt_text[:80]}{'...' if len(prompt_text) > 80 else ''}\"")
+    print(f"  Tokens: {len(tokens)}")
+    
+    # ─── 1. HYPER-CONNECTION ANALYSIS ─────────────────────────────────────
+    print(f"\n{'─'*70}")
+    print(f"  {_BOLD}1. HYPER-CONNECTIONS — Layer Mixing Analysis{_RESET}")
+    print(f"{'─'*70}")
+    print(f"  Formula: output = beta[0] * sublayer_out + beta[1] * alpha[1] * x")
+    print(f"  beta[0]>1 = sublayer amplified | beta[1]*alpha[1]>1 = residual amplified")
+    print()
+    
+    hyper_data = []
+    for i, layer in enumerate(model.layers):
+        ha = layer.hyper_attn
+        hf = layer.hyper_ffn
+        
+        # Attention HyperConnection
+        a_sub = ha.beta[0].item()   # sublayer (attention) weight
+        a_res = (ha.beta[1] * ha.alpha[1]).item()  # residual weight
+        a_ratio = abs(a_sub) / max(abs(a_res), 1e-6)
+        
+        # FFN HyperConnection  
+        f_sub = hf.beta[0].item()   # sublayer (FFN) weight
+        f_res = (hf.beta[1] * hf.alpha[1]).item()  # residual weight
+        f_ratio = abs(f_sub) / max(abs(f_res), 1e-6)
+        
+        hyper_data.append({
+            'layer': i,
+            'attn_sub': a_sub, 'attn_res': a_res, 'attn_ratio': a_ratio,
+            'ffn_sub': f_sub, 'ffn_res': f_res, 'ffn_ratio': f_ratio,
+        })
+        
+        # Color code: green=balanced, yellow=skewed, red=extreme
+        def _color(ratio):
+            if 0.5 <= ratio <= 2.0: return _GREEN
+            elif 0.2 <= ratio <= 5.0: return _YELLOW
+            else: return _RED
+        
+        attn_bar_sub = '█' * int(min(abs(a_sub) * 10, 20))
+        attn_bar_res = '█' * int(min(abs(a_res) * 10, 20))
+        ffn_bar_sub = '█' * int(min(abs(f_sub) * 10, 20))
+        ffn_bar_res = '█' * int(min(abs(f_res) * 10, 20))
+        
+        ac = _color(a_ratio)
+        fc = _color(f_ratio)
+        
+        print(f"  Layer {i:2d} │ {ac}Attn{_RESET}: sub={a_sub:+.3f} res={a_res:+.3f} "
+              f"ratio={a_ratio:.2f} │ {fc}FFN{_RESET}: sub={f_sub:+.3f} res={f_res:+.3f} "
+              f"ratio={f_ratio:.2f}")
+    
+    # Summary
+    avg_attn_ratio = sum(d['attn_ratio'] for d in hyper_data) / len(hyper_data)
+    avg_ffn_ratio = sum(d['ffn_ratio'] for d in hyper_data) / len(hyper_data)
+    print(f"\n  {_BOLD}Summary:{_RESET}")
+    print(f"    Avg Attn sub/res ratio: {avg_attn_ratio:.3f} "
+          f"({'balanced' if 0.5 < avg_attn_ratio < 2.0 else 'SKEWED'})")
+    print(f"    Avg FFN sub/res ratio:  {avg_ffn_ratio:.3f} "
+          f"({'balanced' if 0.5 < avg_ffn_ratio < 2.0 else 'SKEWED'})")
+    
+    # Find most extreme layers
+    max_attn = max(hyper_data, key=lambda d: d['attn_ratio'])
+    min_attn = min(hyper_data, key=lambda d: d['attn_ratio'])
+    print(f"    Most attention-heavy layer: {max_attn['layer']} (ratio={max_attn['attn_ratio']:.2f})")
+    print(f"    Most residual-heavy layer:  {min_attn['layer']} (ratio={min_attn['attn_ratio']:.2f})")
+    
+    # ─── 2. MEMORY BRIDGE ANALYSIS (with hooks) ─────────────────────────
+    print(f"\n{'─'*70}")
+    print(f"  {_BOLD}2. MEMORY BRIDGES — Read/Write/Gate Analysis{_RESET}")
+    print(f"{'─'*70}")
+    
+    # Capture intermediate values via hooks
+    captured = {}
+    hooks = []
+    
+    # Hook memory read outputs
+    for i in range(3):
+        mem = model.memory[i]
+        def make_read_hook(idx):
+            def hook(mod, inp, out):
+                captured[f'read_{idx}'] = out.detach().clone()
+            return hook
+        hooks.append(mem.read_attn.register_forward_hook(make_read_hook(i)))
+        
+        def make_write_hook(idx):
+            def hook(mod, inp, out):
+                captured[f'write_{idx}'] = out.detach().clone()
+            return hook
+        hooks.append(mem.write_attn.register_forward_hook(make_write_hook(i)))
+    
+    # Hook the final memory read (output reflection)
+    def final_read_hook(mod, inp, out):
+        captured['final_read'] = out.detach().clone()
+    hooks.append(model.final_memory_read.register_forward_hook(final_read_hook))
+    
+    # Run forward pass
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+        logits_full, _, _, new_mem = model(x, memory_state=memory_state)
+    
+    # Remove hooks
+    for h in hooks:
+        h.remove()
+    
+    for i in range(3):
+        mem = model.memory[i]
+        print(f"\n  {_CYAN}Bridge {i} ({mem.role}){_RESET} — {mem.num_slots} slots × {mem.dim}d")
+        
+        # Read gate analysis
+        if mem.last_read_gate is not None:
+            gate = mem.last_read_gate.float()
+            gate_mean = gate.mean().item()
+            gate_min = gate.min().item()
+            gate_max = gate.max().item()
+            
+            # Per-token gate values (last sequence position is most relevant for generation)
+            gate_last_pos = gate[0, -1].mean().item()  # gate at last token position
+            
+            # Dimension-wise gate analysis
+            gate_per_dim = gate.mean(dim=(0, 1))  # [D]
+            top_dims = torch.topk(gate_per_dim, k=5).indices.tolist()
+            bot_dims = torch.topk(gate_per_dim, k=5, largest=False).indices.tolist()
+            active_dims = (gate_per_dim > 0.3).sum().item()
+            
+            status_color = _GREEN if gate_mean > 0.2 else (_YELLOW if gate_mean > 0.05 else _RED)
+            status = "ACTIVE" if gate_mean > 0.2 else ("WEAK" if gate_mean > 0.05 else "DEAD")
+            
+            print(f"    Read Gate: {status_color}{status}{_RESET} "
+                  f"avg={gate_mean:.4f} | last_pos={gate_last_pos:.4f} | "
+                  f"range=[{gate_min:.4f}, {gate_max:.4f}]")
+            print(f"    Active dims (gate>0.3): {active_dims}/{mem.dim}")
+            
+            # How much does memory READ actually change the hidden state?
+            if f'read_{i}' in captured:
+                read_out = captured[f'read_{i}'].float()
+                read_magnitude = (gate.mean(dim=-1) * read_out.norm(dim=-1)).mean().item()
+                print(f"    Gated read magnitude: {read_magnitude:.4f} "
+                      f"({'significant' if read_magnitude > 1.0 else 'weak' if read_magnitude > 0.1 else 'negligible'})")
+        else:
+            print(f"    Read Gate: {_RED}NO DATA{_RESET}")
+        
+        # Affinity gate analysis (formerly write mask)
+        if mem.last_write_mask is not None:
+            affinity = mem.last_write_mask.float() # [B, S, D]
+            if affinity.dim() == 3:
+                affinity_per_slot = affinity.mean(dim=(0, 2)) # [S]
+            else:
+                affinity_per_slot = affinity.mean(dim=0)
+            
+            n_active = (affinity_per_slot > 0.05).sum().item()
+            n_total = affinity_per_slot.shape[0]
+            
+            avg_affinity = affinity_per_slot.mean().item()
+            print(f"    Affinity Resonance: {avg_affinity:.4f} average (active slots: {n_active}/{n_total})")
+            
+            # Show which slots have highest affinity
+            top5_write = torch.topk(affinity_per_slot, min(5, n_total))
+            dead_slots = (affinity_per_slot < 0.01).sum().item()
+            print(f"    Highest affinity slots: {list(zip(top5_write.indices.tolist(), [f'{v:.3f}' for v in top5_write.values.tolist()]))}")
+            print(f"    Dead slots (affinity < 0.01): {dead_slots}/{n_total}")
+        
+        # Forget gate analysis
+        if new_mem and len(new_mem) > i:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+                fg = mem.gate(new_mem[i]).clamp(mem.retain_floor, 0.95).float()
+            print(f"    Forget gate (current): mean={fg.mean():.4f} "
+                  f"(memory retains {fg.mean():.1%} of old content per step)")
+            write_influence = (1 - fg.mean().item()) * mem.write_scale
+            if write_influence < 0.05:
+                wi_status = f"{_RED}TOO LOW{_RESET}"
+            elif write_influence < 0.1:
+                wi_status = f"{_YELLOW}LOW{_RESET}"
+            else:
+                wi_status = f"{_GREEN}OK{_RESET}"
+            print(f"    Effective write influence: {write_influence:.4f} ({wi_status})")
+    
+    # ─── 3. OUTPUT REFLECTION ANALYSIS ────────────────────────────────────
+    print(f"\n{'─'*70}")
+    print(f"  {_BOLD}3. OUTPUT REFLECTION — Final Memory→Output Gate{_RESET}")
+    print(f"{'─'*70}")
+    
+    final_scale = model.final_memory_scale.item()
+    print(f"  final_memory_scale: {final_scale:.4f}")
+    
+    if 'final_read' in captured:
+        reflection = captured['final_read'].float()
+        refl_norm = reflection.norm(dim=-1).mean().item()
+        
+        # Compute the gate values
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+            h_normed_approx = model.norm(model.embed(x))  # approximate
+            gate_vals = torch.sigmoid(model.final_memory_gate(h_normed_approx.to(dev))).float()
+        gate_mean = gate_vals.mean().item()
+        gate_last = gate_vals[0, -1].mean().item()
+        
+        effective_scale = final_scale * gate_mean
+        print(f"  Output gate: avg={gate_mean:.4f} | last_pos={gate_last:.4f}")
+        print(f"  Reflection norm: {refl_norm:.4f}")
+        print(f"  Effective injection: scale={effective_scale:.4f} × norm={refl_norm:.4f} "
+              f"= {effective_scale * refl_norm:.4f}")
+        
+        if effective_scale * refl_norm > 1.0:
+            print(f"  {_RED}⚠️ Memory reflection is LARGE — may be injecting noise!{_RESET}")
+        elif effective_scale * refl_norm < 0.01:
+            print(f"  {_YELLOW}⚠️ Memory reflection is negligible — memory not affecting output{_RESET}")
+        else:
+            print(f"  {_GREEN}✅ Memory reflection is moderate{_RESET}")
+    
+    # ─── 4. ABLATION: WITH vs WITHOUT MEMORY ─────────────────────────────
+    print(f"\n{'─'*70}")
+    print(f"  {_BOLD}4. ABLATION — Memory Contribution to Output{_RESET}")
+    print(f"{'─'*70}")
+    
+    # Get top-5 predictions WITH memory
+    last_logits = logits_full[0, -1].float()
+    probs_with = torch.softmax(last_logits, dim=-1)
+    top5_with_p, top5_with_t = torch.topk(probs_with, k=10)
+    
+    print(f"\n  {_GREEN}WITH memory:{_RESET}")
+    with_tokens = []
+    for p, t in zip(top5_with_p, top5_with_t):
+        decoded = enc.decode([t.item()]).replace('\n', '\\n')
+        with_tokens.append(f"'{decoded}'({p.item():.1%})")
+    print(f"    Top-10: {' | '.join(with_tokens)}")
+    
+    # Run WITHOUT memory (disable read gates temporarily)
+    old_biases = []
+    for mem in model.memory:
+        old_biases.append(mem.read_gate[0].bias.data.clone())
+        mem.read_gate[0].bias.data.fill_(-100.0)  # sigmoid(-100) ≈ 0
+    old_final_scale = model.final_memory_scale.data.clone()
+    model.final_memory_scale.data.zero_()
+    
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+        logits_no_mem, _, _, _ = model(x, memory_state=memory_state)
+    
+    # Restore
+    for mem, old_b in zip(model.memory, old_biases):
+        mem.read_gate[0].bias.data.copy_(old_b)
+    model.final_memory_scale.data.copy_(old_final_scale)
+    
+    last_logits_no = logits_no_mem[0, -1].float()
+    probs_without = torch.softmax(last_logits_no, dim=-1)
+    top5_wo_p, top5_wo_t = torch.topk(probs_without, k=10)
+    
+    print(f"  {_RED}WITHOUT memory:{_RESET}")
+    wo_tokens = []
+    for p, t in zip(top5_wo_p, top5_wo_t):
+        decoded = enc.decode([t.item()]).replace('\n', '\\n')
+        wo_tokens.append(f"'{decoded}'({p.item():.1%})")
+    print(f"    Top-10: {' | '.join(wo_tokens)}")
+    
+    # KL divergence between the two distributions
+    kl_div = F.kl_div(
+        torch.log_softmax(last_logits_no, dim=-1),
+        torch.softmax(last_logits, dim=-1),
+        reduction='sum'
+    ).item()
+    
+    # Top-1 agreement
+    top1_with = last_logits.argmax().item()
+    top1_without = last_logits_no.argmax().item()
+    top1_agree = top1_with == top1_without
+    
+    print(f"\n  {_BOLD}Memory impact:{_RESET}")
+    print(f"    KL divergence: {kl_div:.4f} "
+          f"({'no difference' if kl_div < 0.01 else 'slight' if kl_div < 0.1 else 'moderate' if kl_div < 1.0 else 'LARGE'})")
+    print(f"    Top-1 prediction {'AGREES' if top1_agree else 'DIFFERS'}: "
+          f"'{enc.decode([top1_with]).replace(chr(10), chr(92)+chr(110))}' vs "
+          f"'{enc.decode([top1_without]).replace(chr(10), chr(92)+chr(110))}'")
+    
+    if kl_div < 0.01:
+        print(f"    {_RED}⚠️ Memory has ZERO impact on predictions — it's not helping!{_RESET}")
+    elif kl_div < 0.1:
+        print(f"    {_YELLOW}⚠️ Memory has minimal impact — mostly decorative{_RESET}")
+    elif top1_agree:
+        print(f"    {_GREEN}✅ Memory shifts probabilities but doesn't change top prediction{_RESET}")
+    else:
+        print(f"    {_GREEN}✅ Memory actively changes the model's prediction!{_RESET}")
+    
+    # ─── 5. ABLATION: HYPER-CONNECTIONS CONTRIBUTION ─────────────────────
+    print(f"\n{'─'*70}")
+    print(f"  {_BOLD}5. ABLATION — HyperConnection vs Standard Residual{_RESET}")
+    print(f"{'─'*70}")
+    
+    # Save original hyper params
+    old_hyper = []
+    for layer in model.layers:
+        old_hyper.append({
+            'ha_alpha': layer.hyper_attn.alpha.data.clone(),
+            'ha_beta': layer.hyper_attn.beta.data.clone(),
+            'hf_alpha': layer.hyper_ffn.alpha.data.clone(),
+            'hf_beta': layer.hyper_ffn.beta.data.clone(),
+        })
+        # Set to standard residual: output = 1.0 * sublayer + 1.0 * x
+        layer.hyper_attn.alpha.data[1] = 1.0
+        layer.hyper_attn.beta.data[0] = 1.0
+        layer.hyper_attn.beta.data[1] = 1.0
+        layer.hyper_ffn.alpha.data[1] = 1.0
+        layer.hyper_ffn.beta.data[0] = 1.0
+        layer.hyper_ffn.beta.data[1] = 1.0
+    
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+        logits_std_res, _, _, _ = model(x, memory_state=memory_state)
+    
+    # Restore
+    for layer, saved in zip(model.layers, old_hyper):
+        layer.hyper_attn.alpha.data.copy_(saved['ha_alpha'])
+        layer.hyper_attn.beta.data.copy_(saved['ha_beta'])
+        layer.hyper_ffn.alpha.data.copy_(saved['hf_alpha'])
+        layer.hyper_ffn.beta.data.copy_(saved['hf_beta'])
+    
+    last_logits_std = logits_std_res[0, -1].float()
+    probs_std = torch.softmax(last_logits_std, dim=-1)
+    top5_std_p, top5_std_t = torch.topk(probs_std, k=10)
+    
+    print(f"  {_GREEN}WITH learned HyperConnections:{_RESET}")
+    print(f"    Top-10: {' | '.join(with_tokens)}")
+    
+    std_tokens = []
+    for p, t in zip(top5_std_p, top5_std_t):
+        decoded = enc.decode([t.item()]).replace('\n', '\\n')
+        std_tokens.append(f"'{decoded}'({p.item():.1%})")
+    print(f"  {_YELLOW}WITH standard residual (alpha=1, beta=[1,1]):{_RESET}")
+    print(f"    Top-10: {' | '.join(std_tokens)}")
+    
+    kl_hyper = F.kl_div(
+        torch.log_softmax(last_logits_std, dim=-1),
+        torch.softmax(last_logits, dim=-1),
+        reduction='sum'
+    ).item()
+    
+    top1_std = last_logits_std.argmax().item()
+    hyper_agree = top1_with == top1_std
+    
+    print(f"\n  {_BOLD}HyperConnection impact:{_RESET}")
+    print(f"    KL divergence: {kl_hyper:.4f} "
+          f"({'no difference' if kl_hyper < 0.01 else 'slight' if kl_hyper < 0.5 else 'moderate' if kl_hyper < 2.0 else 'LARGE'})")
+    print(f"    Top-1 prediction {'AGREES' if hyper_agree else 'DIFFERS'}: "
+          f"'{enc.decode([top1_with]).replace(chr(10), chr(92)+chr(110))}' vs "
+          f"'{enc.decode([top1_std]).replace(chr(10), chr(92)+chr(110))}'")
+    
+    if kl_hyper < 0.01:
+        print(f"    {_YELLOW}HyperConnections haven't diverged from standard residuals{_RESET}")
+    elif kl_hyper < 0.5:
+        print(f"    {_GREEN}HyperConnections provide slight optimization over standard residuals{_RESET}")
+    else:
+        print(f"    {_GREEN}✅ HyperConnections are actively shaping the output!{_RESET}")
+    
+    # ─── 6. GENERATION COMPARISON ────────────────────────────────────────
+    print(f"\n{'─'*70}")
+    print(f"  {_BOLD}6. GENERATION COMPARISON (greedy, 20 tokens){_RESET}")
+    print(f"{'─'*70}")
+    
+    def _greedy_generate(label, n=20):
+        tokens_gen = []
+        cur_x = x.clone()
+        cur_mem = memory_state
+        for _ in range(n):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+                logits, _, _, cur_mem = model(cur_x, memory_state=cur_mem)
+            next_tok = logits[0, -1].float().argmax().item()
+            if next_tok == enc.eot_token:
+                break
+            tokens_gen.append(next_tok)
+            # FIX: Append to sequence instead of replacing it
+            cur_x = torch.cat([cur_x, torch.tensor([[next_tok]], device=dev)], dim=1)
+        text = enc.decode(tokens_gen).replace('\n', '\\n')[:120]
+        print(f"  {label}: \"{text}\"")
+    
+    _greedy_generate(f"{_GREEN}Full model{_RESET}                           ")
+    
+    # Ablate Memory
+    for mem in model.memory:
+        mem.read_gate[0].bias.data.fill_(-100.0)
+    model.final_memory_scale.data.zero_()
+    
+    _greedy_generate(f"{_YELLOW}With HyperConnections (NO Memory){_RESET}      ")
+    
+    # Ablate Hyperconnections (already ablated memory)
+    for layer in model.layers:
+        layer.hyper_attn.alpha.data[1] = 1.0
+        layer.hyper_attn.beta.data[0] = 1.0
+        layer.hyper_attn.beta.data[1] = 1.0
+        layer.hyper_ffn.alpha.data[1] = 1.0
+        layer.hyper_ffn.beta.data[0] = 1.0
+        layer.hyper_ffn.beta.data[1] = 1.0
+        
+    _greedy_generate(f"{_RED}Core model (NO Memory, NO Hyper){_RESET}       ")
+    
+    # Restore Memory (keep hyperconnections ablated)
+    for mem, old_b in zip(model.memory, old_biases):
+        mem.read_gate[0].bias.data.copy_(old_b)
+    model.final_memory_scale.data.copy_(old_final_scale)
+    
+    _greedy_generate(f"{_YELLOW}With Memory (NO HyperConnections){_RESET}      ")
+    
+    # Restore HyperConnections
+    for layer, saved in zip(model.layers, old_hyper):
+        layer.hyper_attn.alpha.data.copy_(saved['ha_alpha'])
+        layer.hyper_attn.beta.data.copy_(saved['ha_beta'])
+        layer.hyper_ffn.alpha.data.copy_(saved['hf_alpha'])
+        layer.hyper_ffn.beta.data.copy_(saved['hf_beta'])
+    
+    print(f"\n{'═'*70}")
+    print(f"  {_BOLD}ANALYTICS COMPLETE{_RESET}")
+    print(f"{'═'*70}\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 10. INTERACTIVE MODE  (Phase 2 — persistent memory across turns)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2099,12 +2551,20 @@ def run_interactive(model, enc, cfg, spec_decoder=None, chat_memory_mode: str = 
 
         while True:
             try:
-                user_in = input("\n👤 Prompt (or 'back', '/inspect', '/trace <text>', '/reset memory'): ").strip()
+                user_in = input("\n👤 Prompt (or 'back', '/inspect', '/trace <text>', '/analytics', '/reset memory'): ").strip()
             except (KeyboardInterrupt, EOFError):
                 return
             # Interactive commands
             if user_in.startswith("/inspect"):
                 print_memory_inspector(model, enc, session_memory)
+                continue
+            if user_in.startswith("/analytics"):
+                analytics_text = user_in[len("/analytics"):].strip()
+                if not analytics_text:
+                    analytics_text = f"System: {system_prompt}\nUser: What is your architecture?\nAssistant:"
+                else:
+                    analytics_text = f"System: {system_prompt}\nUser: {analytics_text}\nAssistant:"
+                run_deep_analytics(model, enc, analytics_text, memory_state=session_memory)
                 continue
             if user_in.startswith("/trace"):
                 trace_text = user_in[len("/trace"):].strip()

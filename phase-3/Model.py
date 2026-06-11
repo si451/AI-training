@@ -294,17 +294,31 @@ class GlobalNeuralMemory(nn.Module):
         nn.init.zeros_(self.read_gate[0].weight)
         nn.init.constant_(self.read_gate[0].bias, 0.0)
 
-        # ── STEP 2: Sparse competitive write ────────────────────────────────
-        # Dropout on write path to encourage diverse slot usage
-        self.write_dropout = nn.Dropout(0.05)
-
+        # ── STEP 2: Continuous Associative Write ────────────────────────────
         self.write_scale = write_scale
         self.retain_floor = retain_floor
+        
+        # Affinity gate — determines how relevant the new context is to the slot
+        self.affinity_gate = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.Sigmoid()
+        )
+        nn.init.zeros_(self.affinity_gate[0].weight)
+        nn.init.constant_(self.affinity_gate[0].bias, -1.0) # Start slightly closed (0.27) to avoid saturating memory
+
 
         # Forget gate — controls how much old memory is retained
         self.gate = nn.Sequential(nn.Linear(dim, dim), nn.Sigmoid())
         nn.init.zeros_(self.gate[0].weight)
-        nn.init.constant_(self.gate[0].bias, 2.0)  # Start with high retention
+        
+        # Calculate optimal init bias based on retain_floor (target ~0.1 higher than floor)
+        target_retention = min(retain_floor + 0.3, 0.9)
+        if retain_floor == 0.3: target_retention = 0.6
+        elif retain_floor == 0.5: target_retention = 0.7
+        elif retain_floor == 0.7: target_retention = 0.8
+        
+        bias_val = math.log(target_retention / (1.0 - target_retention))
+        nn.init.constant_(self.gate[0].bias, bias_val)
 
         # ── Diagnostic state (not parameters, not saved) ────────────────────
         self.last_read_gate: Optional[torch.Tensor] = None
@@ -332,52 +346,26 @@ class GlobalNeuralMemory(nn.Module):
         # Store for diagnostics and usefulness loss (DO NOT DETACH OR LOSS GRADIENTS WILL SEVER)
         self.last_read_gate = gate
 
-        # ── WRITE: Sparse top-k competitive routing ─────────────────────────
-        # 1. Score each slot's affinity to the current context (Scale by sqrt(D) to prevent sigmoid saturation!)
-        context_summary = x_norm.mean(dim=1, keepdim=True)  # [B, 1, D]
-        slot_scores = (mem_norm * context_summary).sum(dim=-1) / math.sqrt(x_norm.shape[-1])  # [B, num_slots]
-
-        # 1.5. Prevent Dead Slot Collapse (Exploration Noise)
-        if self.training:
-            # Add scaled Gumbel-like noise to encourage exploring unused slots
-            noise = torch.randn_like(slot_scores) * slot_scores.std(dim=-1, keepdim=True) * 0.5
-            routing_scores = slot_scores + noise
-        else:
-            routing_scores = slot_scores
-
-        # 2. Select slots for update (dynamic independent routing via STE)
-        soft_mask = torch.sigmoid(routing_scores)
-        hard_mask = (soft_mask > 0.5).float()
-        
-        # 2.5. Create Hard Write Mask
-        # Forward pass uses hard_mask, backward pass flows gradients to soft_mask
-        write_mask = hard_mask - soft_mask.detach() + soft_mask  # [B, S]
-        write_mask_3d = write_mask.unsqueeze(-1)  # [B, S, 1]
-        
-        # Compute MoE Load Balancing Loss (only during training)
-        lb_loss = torch.tensor(0.0, device=x.device)
-        if self.training:
-            # P: mean routing probability across the batch
-            P = F.softmax(slot_scores, dim=-1).mean(dim=0)  # [S]
-            # f: fraction of times each slot was actually selected
-            f = hard_mask.mean(dim=0)  # [S]
-            # Standard MoE load balancing loss: S * sum(f_i * P_i)
-            num_slots_s = slot_scores.size(-1)
-            lb_loss = num_slots_s * torch.sum(f * P)
-
-        # Store for diagnostics (store exact hard mask for accurate metric counting)
-        self.last_write_mask = hard_mask.detach()
-
-        # 3. Compute write update with slot identity injection
+        # ── WRITE: Continuous Associative Encoding ──────────────────────────
+        # 1. Slots query the sequence for relevant information
         mem_query = mem_norm + self.memory_init.unsqueeze(0)
         mem_update = self.write_attn(mem_query, x_norm)
-        mem_update = self.write_dropout(mem_update)
-
-        # 4. Gated update — winning slots get full candidate, losing slots get 5% leak
-        forget_gate = self.gate(memory_state).clamp(self.retain_floor, 0.95)
-        candidate = forget_gate * memory_state + (1 - forget_gate) * (self.write_scale * mem_update)
-        new_memory = write_mask_3d * candidate + (1 - write_mask_3d) * memory_state
+        
+        # 2. Affinity Gate: How relevant is the extracted sequence information to the slot?
+        affinity = self.affinity_gate(torch.cat([mem_norm, mem_update], dim=-1))
+        
+        # 3. Forget Gate: How much of the old memory to retain
+        forget = self.gate(memory_state).clamp(self.retain_floor, 0.95)
+        
+        # 4. Continuous update based on affinity resonance
+        candidate = forget * memory_state + (1 - forget) * (self.write_scale * mem_update)
+        new_memory = affinity * candidate + (1 - affinity) * memory_state
+        
         new_memory = self.mem_norm(new_memory)
+        
+        # Diagnostics
+        self.last_write_mask = affinity.detach() # We repurpose this to track affinity magnitude
+        lb_loss = torch.tensor(0.0, device=x.device) # Removed MoE loss, kept for API compatibility
 
         return x_new, new_memory, lb_loss
 
@@ -495,7 +483,7 @@ class Nexus(nn.Module):
         # Output Reflection: lets the final layers read the newly written memory
         # This ties the memory writing mechanism to the LM loss.
         self.final_memory_read = CrossAttention(dim, heads, max(1, heads // 4))
-        self.final_memory_scale = nn.Parameter(torch.tensor(0.1))
+        self.final_memory_scale = nn.Parameter(torch.tensor(0.05))
         self.final_memory_gate = nn.Linear(dim, 1)
         nn.init.zeros_(self.final_memory_gate.weight)
         nn.init.constant_(self.final_memory_gate.bias, 0.0) # Starts at gate=0.5

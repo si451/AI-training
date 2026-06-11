@@ -1245,6 +1245,19 @@ def train_worker(rank: int, world_size: int):
     # Furthermore, optimizer states must be loaded individually on every GPU.
     start_step = load_latest_checkpoint(raw_model, optimizer, scaler)
     
+    # ── FIX: Reset broken memory gates after loading checkpoint ────────────────
+    # Memory forget gates got stuck at 93% retention, freezing the vectors.
+    with torch.no_grad():
+        import math
+        for i, mem in enumerate(raw_model.memory):
+            # Target retentions: Lexical(0.6), Semantic(0.7), Reasoning(0.8)
+            target_retention = [0.6, 0.7, 0.8][i]
+            new_bias_val = math.log(target_retention / (1.0 - target_retention))
+            mem.gate[0].bias.data.fill_(new_bias_val)
+            if local_rank == 0:
+                new_ret = torch.sigmoid(mem.gate[0].bias.data.float()).mean().item()
+                print(f"  🔧 Bridge {i} ({mem.role}): reset forget bias to {new_bias_val:.2f} (retention {new_ret:.2f})")
+    
     start_step_t = torch.tensor(start_step, device=device)
     dist.broadcast(start_step_t, src=0)
     start_step = int(start_step_t.item())
@@ -1389,20 +1402,22 @@ def train_worker(rank: int, world_size: int):
             for bridge_idx, mem_mod in enumerate(model.memory):
                 print(f"    --- Bridge {bridge_idx} (random init) ---", flush=True)
 
-        print(f"\n  🏆 [Slot Competition] Write Router Statistics:", flush=True)
+        print(f"\n  🎯 [Affinity Resonance] Memory Continuous Update Statistics:", flush=True)
         for bridge_idx, mem_mod in enumerate(model.memory):
             if hasattr(mem_mod, 'last_write_mask') and mem_mod.last_write_mask is not None:
-                mask = mem_mod.last_write_mask
-                if mask.dim() == 3:
-                    usage = mask.float().mean(dim=(0, 1))
+                affinity = mem_mod.last_write_mask
+                if affinity.dim() == 3:
+                    affinity_per_slot = affinity.float().mean(dim=(0, 2)) # [S]
                 else:
-                    usage = mask.float().mean(dim=0)
-                active = (usage > 0.01).sum().item()
-                total = usage.shape[-1]
-                top5 = torch.topk(usage, min(5, total))
+                    affinity_per_slot = affinity.float().mean(dim=0)
+                
+                n_active = (affinity_per_slot > 0.05).sum().item()
+                n_total = affinity_per_slot.shape[0]
+                avg_affinity = affinity_per_slot.mean().item()
+                top5 = torch.topk(affinity_per_slot, min(5, n_total))
                 print(f"    Bridge {bridge_idx} ({mem_mod.role}): "
-                      f"{active}/{total} slots active, "
-                      f"top-5 usage: {[f'{v:.2f}' for v in top5.values.tolist()]}", flush=True)
+                      f"avg_affinity={avg_affinity:.3f} | {n_active}/{n_total} slots active, "
+                      f"top-5 affinity: {[f'{v:.2f}' for v in top5.values.tolist()]}", flush=True)
 
         print(f"\n  🚪 [Read Gate] Memory Usage Rates:", flush=True)
         for bridge_idx, mem_mod in enumerate(model.memory):
@@ -1568,7 +1583,7 @@ def train_worker(rank: int, world_size: int):
 
         optimizer.zero_grad(set_to_none=True)
         loss_acc = toxic_hit_acc = toxic_penalty_acc = mtp_acc = mem_div_acc = 0.0
-        mem_use_acc = mem_pred_acc = mem_temp_acc = acc_acc = 0.0
+        mem_use_acc = mem_pred_acc = acc_acc = 0.0
         bptt_loss = 0.0
 
         for micro_idx in range(CFG["grad_accum_steps"]):
@@ -1613,37 +1628,6 @@ def train_worker(rank: int, world_size: int):
                     mem_use_loss = raw_model.memory_usefulness_loss(read_gates)
                     mem_pred_loss = raw_model.memory_prediction_loss(new_mem, h_normed)
 
-                    # Temporal consistency loss
-                    if persistent_mem is not None:
-                        temporal_loss = 0.0
-                        valid_bridges = 0
-                        for i in range(3):
-                            old_mem = persistent_mem[i].float()
-                            # Check which sequences in the batch have valid (non-zeroed) memory
-                            # shape: [B, slots, dim] -> [B]
-                            is_valid = (old_mem.abs().sum(dim=(1, 2)) > 1e-6).float()
-                            
-                            if is_valid.sum() > 0:
-                                old_norm = F.normalize(old_mem, dim=-1)
-                                new_norm = F.normalize(new_mem[i].float(), dim=-1)
-                                
-                                # Cosine similarity per slot: [B, slots]
-                                sim = (old_norm * new_norm).sum(dim=-1)
-                                # Average across slots: [B]
-                                sim = sim.mean(dim=-1)
-                                
-                                # Mask and average across valid sequences
-                                slot_sim = (sim * is_valid).sum() / is_valid.sum()
-                                temporal_loss += (1.0 - slot_sim)
-                                valid_bridges += 1
-                                
-                        if valid_bridges > 0:
-                            temporal_loss = temporal_loss / valid_bridges
-                        else:
-                            temporal_loss = torch.tensor(0.0, device=device)
-                    else:
-                        temporal_loss = torch.tensor(0.0, device=device)
-
                     # ── HyperConnection Beta Regularization ────────────────────
                     # Prevent beta from growing unbounded, which amplifies residual
                     # stream and causes deep-layer activation explosion (std > 7)
@@ -1660,8 +1644,6 @@ def train_worker(rank: int, world_size: int):
                         + CFG.get("mem_diversity_weight", 0.5) * mem_div_loss
                         + CFG.get("mem_usage_weight", 0.2) * mem_use_loss
                         + CFG.get("mem_prediction_weight", 0.1) * mem_pred_loss
-                        + CFG.get("mem_temporal_weight", 0.1) * temporal_loss
-                        + CFG.get("moe_lb_weight", 0.01) * aux_loss
                         + CFG.get("hyper_beta_weight", 0) * hyper_beta_loss
                     ) / CFG["grad_accum_steps"]
                     
@@ -1685,7 +1667,6 @@ def train_worker(rank: int, world_size: int):
             mem_div_acc     += mem_div_loss.item()
             mem_use_acc     += mem_use_loss.item()
             mem_pred_acc    += mem_pred_loss.item()
-            mem_temp_acc    += temporal_loss.item()
 
         # True BPTT: Massive single backward pass across the sequence of chunks
         bptt_loss.backward()
@@ -1746,8 +1727,7 @@ def train_worker(rank: int, world_size: int):
                 "tox_tgt":  f"{toxic_hit_acc/ga:.2%}",
                 "mdiv":     f"{mem_div_acc/ga:.4f}",
                 "muse":     f"{mem_use_acc/ga:.4f}",
-                "mpred":    f"{mem_pred_acc/ga:.4f}",
-                "mtemp":    f"{mem_temp_acc/ga:.4f}",
+                "mpred":    f"{mem_pred_acc/ga:.4f}"
             }
            
             if component_gnorms:
